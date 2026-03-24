@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { add, connect, list, edit, remove, setup, help } from "./commands";
+import { add, connect, list, edit, remove, setup, help, exportConnections, importConnections } from "./commands";
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -72,6 +72,20 @@ async function main() {
         process.exit(1);
       }
       await edit(alias, flags);
+      break;
+    }
+    case "export": {
+      const file = positionals[0];
+      await exportConnections(file, flags);
+      break;
+    }
+    case "import": {
+      const file = positionals[0];
+      if (!file) {
+        console.error("Usage: ssh-easy import <file>");
+        process.exit(1);
+      }
+      await importConnections(file, flags);
       break;
     }
     case "setup":

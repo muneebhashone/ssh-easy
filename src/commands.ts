@@ -1,6 +1,6 @@
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
-import { chmod, unlink } from "node:fs/promises";
+import { join, basename } from "node:path";
+import { chmod, unlink, mkdir } from "node:fs/promises";
 import {
   loadConfig,
   saveConfig,
@@ -8,7 +8,7 @@ import {
   encodePassword,
   decodePassword,
 } from "./config";
-import type { Connection } from "./types";
+import type { Connection, ExportedConnection, ExportFile } from "./types";
 
 const isWindows = process.platform === "win32";
 
@@ -482,6 +482,148 @@ export async function setup() {
   console.log();
 }
 
+export async function exportConnections(file: string | undefined, flags: Record<string, string | undefined>) {
+  const config = await loadConfig();
+
+  if (config.connections.length === 0) {
+    console.error("No connections to export.");
+    process.exit(1);
+  }
+
+  let connections = config.connections;
+
+  if (flags.aliases) {
+    const requested = flags.aliases.split(",").map((a) => a.trim().toLowerCase());
+    connections = connections.filter((c) => requested.includes(c.alias.toLowerCase()));
+    const found = connections.map((c) => c.alias.toLowerCase());
+    const missing = requested.filter((a) => !found.includes(a));
+    if (missing.length > 0) {
+      console.error(`Error: alias(es) not found: ${missing.join(", ")}`);
+      process.exit(1);
+    }
+  }
+
+  const exported: ExportedConnection[] = [];
+
+  for (const conn of connections) {
+    const entry: ExportedConnection = {
+      alias: conn.alias,
+      host: conn.host,
+      username: conn.username,
+      port: conn.port,
+      authMethod: conn.authMethod,
+    };
+
+    if (conn.password) {
+      entry.password = conn.password;
+    }
+
+    if (conn.authMethod === "key" && conn.keyPath) {
+      const keyFile = Bun.file(conn.keyPath);
+      if (await keyFile.exists()) {
+        const content = await keyFile.arrayBuffer();
+        entry.keyContent = Buffer.from(content).toString("base64");
+        entry.keyFilename = basename(conn.keyPath);
+      } else {
+        console.warn(`Warning: key file not found at ${conn.keyPath} for "${conn.alias}" — exporting without key content`);
+      }
+    }
+
+    exported.push(entry);
+  }
+
+  const exportData: ExportFile = {
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    connections: exported,
+  };
+
+  const outPath = file || "ssh-easy-export.json";
+  await Bun.write(outPath, JSON.stringify(exportData, null, 2));
+
+  console.log(`\nExported ${exported.length} connection(s) to ${outPath}`);
+  console.log("\nWARNING: This file contains sensitive data (private keys, passwords).");
+  console.log("Store it securely and delete after use.\n");
+}
+
+export async function importConnections(file: string, flags: Record<string, string | undefined>) {
+  let data: ExportFile;
+  try {
+    data = await Bun.file(file).json();
+  } catch {
+    console.error(`Error: could not read or parse "${file}"`);
+    process.exit(1);
+  }
+
+  if (data.version !== 1) {
+    console.error(`Error: unsupported export version (got ${data.version}, expected 1)`);
+    process.exit(1);
+  }
+
+  if (!data.connections || data.connections.length === 0) {
+    console.error("Error: no connections found in export file.");
+    process.exit(1);
+  }
+
+  const config = await loadConfig();
+  const overwrite = "overwrite" in flags;
+  const sshDir = join(homedir(), ".ssh");
+  await mkdir(sshDir, { recursive: true });
+
+  let imported = 0;
+  let skipped = 0;
+
+  for (const entry of data.connections) {
+    const existingIdx = config.connections.findIndex(
+      (c) => c.alias.toLowerCase() === entry.alias.toLowerCase()
+    );
+
+    if (existingIdx !== -1) {
+      if (!overwrite) {
+        console.warn(`Skipping "${entry.alias}" — alias already exists (use --overwrite to replace)`);
+        skipped++;
+        continue;
+      }
+      config.connections.splice(existingIdx, 1);
+    }
+
+    const conn: Connection = {
+      alias: entry.alias,
+      host: entry.host,
+      username: entry.username,
+      port: entry.port,
+      authMethod: entry.authMethod,
+    };
+
+    if (entry.password) {
+      conn.password = entry.password;
+    }
+
+    if (entry.keyContent) {
+      const keyDest = join(sshDir, `ssh-easy-${entry.alias}`);
+      const keyBytes = Buffer.from(entry.keyContent, "base64");
+      await Bun.write(keyDest, keyBytes);
+      if (!isWindows) {
+        await chmod(keyDest, 0o600);
+      }
+      conn.keyPath = keyDest;
+    }
+
+    config.connections.push(conn);
+    imported++;
+  }
+
+  await saveConfig(config);
+
+  console.log(`\nImported ${imported} connection(s).`);
+  if (skipped > 0) {
+    console.log(`Skipped ${skipped} connection(s) (already exist).`);
+  }
+  if (imported > 0) {
+    console.log("SSH keys placed in ~/.ssh/\n");
+  }
+}
+
 export function help() {
   console.log(`
 ssh-easy — Simple SSH connection manager
@@ -493,6 +635,8 @@ Usage:
   ssh-easy list | ls            List all saved connections
   ssh-easy edit <alias>         Edit a saved connection
   ssh-easy remove | rm <alias>  Remove a saved connection
+  ssh-easy export [file]        Export connections to a portable file
+  ssh-easy import <file>        Import connections from an export file
   ssh-easy setup                Check & install system dependencies
   ssh-easy help                 Show this help
 
@@ -504,11 +648,19 @@ Flags (for add/edit):
   --password [password]   Use password auth (optionally provide password)
   --yes, -y               Skip confirmation (for remove)
 
+Flags (for export/import):
+  --aliases <a,b,c>       Export only specific connections
+  --overwrite             Overwrite existing connections on import
+
 Examples:
   ssh-easy add prod --host 10.0.1.50 --user deploy --key ~/.ssh/id_rsa
   ssh-easy add dev --host 192.168.1.100 --user root --password s3cret
   ssh-easy prod
   ssh-easy list
   ssh-easy rm dev
+  ssh-easy export
+  ssh-easy export backup.json --aliases prod,dev
+  ssh-easy import backup.json
+  ssh-easy import backup.json --overwrite
 `);
 }
