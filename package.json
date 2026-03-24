@@ -1,0 +1,11 @@
+{
+  "name": "ssh-easy",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": {
+    "ssh-easy": "src/index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
